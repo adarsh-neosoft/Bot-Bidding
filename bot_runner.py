@@ -47,7 +47,13 @@ from state_store import (
 )
 
 
-from logger_directory import bot_runner
+from logger_directory import attach_combined_handler, bot_runner
+
+# Mirrors every log line from this run (this process and every ws_adapter
+# child it spawns below) into one combined file, on top of the existing
+# per-module/per-level files. See logger_directory.attach_combined_handler.
+attach_combined_handler()
+
 logger = bot_runner
 
 # ---------------------------------------------------------------------------
