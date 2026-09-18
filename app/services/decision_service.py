@@ -28,6 +28,9 @@ class DecisionService:
     caller is expected to persist.
     """
 
+    # Bot only participates once this many seconds remain in the auction.
+    BID_WINDOW_SECONDS = 15 * 60
+
     def __init__(self, agent_name: str = "AutoPlayer-v2"):
         self.agent = agent_name
 
@@ -35,6 +38,23 @@ class DecisionService:
 
     def decide(self, req_obj, state: Dict[str, Any]) -> Dict[str, Any]:
         """Orchestrate one decision for req_obj given the current state."""
+        remaining = float(getattr(req_obj, "remaining_duration", 0) or 0)
+        if remaining > self.BID_WINDOW_SECONDS:
+            return {
+                "status": "skip",
+                "reason": "outside_bidding_window",
+                "bid_amount": None,
+                "delay_seconds": 0,
+                "metadata": {
+                    "is_automated": True,
+                    "agent": self.agent,
+                    "remaining_duration": remaining,
+                    "bid_window_seconds": self.BID_WINDOW_SECONDS,
+                    "generated_at": now_iso(),
+                },
+                "updated_state": state,
+            }
+
         persona = self._ensure_persona(req_obj, state)
         fuzzy_inputs = self._build_fuzzy_inputs(req_obj)
         category, fscore = compute_bid_category(fuzzy_inputs)

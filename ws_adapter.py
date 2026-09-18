@@ -13,6 +13,7 @@ Responsibilities per process:
 
 import os
 import json
+import re
 import threading
 import time
 import uuid
@@ -69,6 +70,17 @@ _PENDING_LOCK = threading.Lock()
 # Last-known per-auction item metadata so update_bid messages missing fields
 # (min_inc in particular) don't regress to default `1`.
 _LAST_ITEM_MAP = {}  # auction_id -> {item_id: item_block}
+
+
+def _lookup_cached_best(auction_id, item_id):
+    """Return the most recently observed BEST_PRICE for (auction_id, item_id),
+    or None if nothing has been cached yet. Registered with AuctionPlayer as
+    its live-price lookup so submits use the latest price this connection
+    has actually seen instead of a stale decision-time snapshot."""
+    item = _LAST_ITEM_MAP.get(auction_id, {}).get(item_id)
+    if item is None:
+        return None
+    return item.get("BEST_PRICE")
 
 
 # ---------------------------------------------------------------------------
@@ -222,16 +234,39 @@ def _convert_join_response_to_snapshot(join_data: dict) -> dict:
 
 
 def _convert_update_to_snapshot(update_msg: dict) -> dict:
-    """Convert a place_bid update into a single-item snapshot. Falls back
-    to the cached metadata for anything the update omits."""
+    """Convert a place_bid/bid_added update into a single-item snapshot.
+    Falls back to the cached metadata for anything the update omits.
+
+    The server uses more than one shape for these messages: some wrap
+    fields under 'data' (e.g. {'data': {...}, 'action': 'place_bid', ...})
+    while others (e.g. action='bid_added') are flat with product_id/
+    bid_amount/auction_id at the top level. We check both so a message's
+    real price/id fields aren't silently dropped just because they weren't
+    where the original nested shape expected them.
+    """
     try:
         data = update_msg.get("data") or {}
-        pid = data.get("auction_product") or data.get("auction_product_id")
+        pid = (
+            data.get("auction_product")
+            or data.get("auction_product_id")
+            or update_msg.get("product_id")
+            or update_msg.get("auction_product_id")
+        )
         if pid is None:
             logger.debug("update missing product id; keys=%s", list(update_msg.keys()))
             return {}
 
-        auction_id = update_msg.get("auction_id")
+        # NOTE: `pk` on these messages is the bid/record id, not the auction
+        # id (confirmed via logs: it echoed as an unrelated small integer
+        # while the real auction id is a UUID) - do not use it as a fallback
+        # here. Each ws_adapter process is bound to exactly one auction for
+        # its lifetime, so AUCTION_PK is the correct fallback, mirroring
+        # _convert_join_response_to_snapshot.
+        auction_id = (
+            update_msg.get("auction_id")
+            or data.get("auction_id")
+            or AUCTION_PK
+        )
 
         # bot_features may be top-level, nested under 'data', or absent.
         bot_features = (
@@ -256,7 +291,15 @@ def _convert_update_to_snapshot(update_msg: dict) -> dict:
         else:
             min_bid = float(raw_min)
 
-        raw_current = bot_features.get("current_bid") or cached.get("BEST_PRICE")
+        # A flat top-level `bid_amount` (as sent on action='bid_added') is
+        # the actual new price and takes priority over the stale cache.
+        raw_current = (
+            bot_features.get("current_bid")
+            or update_msg.get("bid_amount")
+            or data.get("bid_amount")
+            or data.get("current_bid")
+            or cached.get("BEST_PRICE")
+        )
         raw_target = bot_features.get("target_price") or cached.get("THRESHOLD_PRICE")
         raw_max = bot_features.get("maximum_increment_price") or cached.get("MAX_BID_AMOUNT")
 
@@ -285,16 +328,73 @@ def _convert_update_to_snapshot(update_msg: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Pending-submit registry
 # ---------------------------------------------------------------------------
-def _signal_pending(req_id: str, data: dict) -> None:
+def _signal_pending(req_id: str, data: dict):
     """If this request_id matches a pending submit, hand it the server
-    response and wake the waiter."""
+    response, wake the waiter, and return the entry (so the caller can
+    recover which auction/item this submit was for)."""
     if not req_id:
-        return
+        return None
     with _PENDING_LOCK:
         entry = _PENDING_SUBMITS.get(req_id)
     if entry is not None:
         entry["result"] = data
         entry["event"].set()
+    return entry
+
+
+def _signal_pending_unmatched(data: dict):
+    """Resolve a response that carries no request_id (the server's
+    synchronous place_bid validation errors and its 'bid_added' success
+    confirmations both omit it - see e.g. {'status': 'error', 'message':
+    'Bid must be greater than current highest bid...'} or {'action':
+    'bid_added', 'status': 'success', ...}). Without a request_id we can't
+    be certain which submit this belongs to, so only act when exactly one
+    is in flight - the common case since a submitter blocks until its own
+    echo/timeout before returning. Returns the resolved entry, or None."""
+    with _PENDING_LOCK:
+        if len(_PENDING_SUBMITS) != 1:
+            return None
+        req_id, entry = next(iter(_PENDING_SUBMITS.items()))
+    entry["result"] = data
+    entry["event"].set()
+    logger.debug("Resolved request-id-less response against sole pending submit %s", req_id)
+    return entry
+
+
+_REJECTED_PRICE_RE = re.compile(r"([\d,]+\.\d{1,2})")
+
+
+def _parse_rejected_price(message: str):
+    """Pull the real current-highest price out of a rejection message like
+    'Bid must be greater than current highest bid (9200.00).' so the local
+    cache can be corrected immediately instead of staying stale until the
+    next (possibly non-existent) price-bearing broadcast."""
+    if not message:
+        return None
+    matches = _REJECTED_PRICE_RE.findall(message)
+    if not matches:
+        return None
+    try:
+        return float(matches[-1].replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _update_cached_price(auction_id, product_id, price) -> None:
+    if auction_id is None or product_id is None or price is None:
+        return
+    item = _LAST_ITEM_MAP.setdefault(auction_id, {}).setdefault(product_id, {"ITEM_ID": product_id})
+    old = item.get("BEST_PRICE")
+    try:
+        new_price = float(price)
+    except (TypeError, ValueError):
+        return
+    item["BEST_PRICE"] = new_price
+    if old != new_price:
+        logger.info(
+            "Corrected cached best price for %s:%s: %s -> %s",
+            auction_id, product_id, old, new_price,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -329,18 +429,65 @@ def _on_message(ws, message):
             process_external_snapshot(snap)
         return
 
-    if status == "success" and action in ["place_bid", "bid_update"]:
-        # Own-echo wakes the submitter; snapshot is still dispatched so the
-        # bidding loop sees the updated best price.
-        _signal_pending(data.get("request_id"), data)
+    if status == "success" and action != "join_auction":
+        # Confirmation of a placed bid. The server uses different action
+        # names for this ("place_bid", "bid_update", "bid_added", ...) and
+        # none of them reliably echo our request_id, so resolve by id when
+        # present and fall back to "the one submit currently in flight"
+        # otherwise (see _signal_pending_unmatched).
+        entry = _signal_pending(data.get("request_id"), data) or _signal_pending_unmatched(data)
+
+        # Correct the cache from whatever ground-truth price this message
+        # carries (flat `bid_amount` on bid_added, or nested under 'data')
+        # rather than waiting on a broadcast shape that may never arrive.
+        payload = (entry or {}).get("payload") or {}
+        msg_data = data.get("data") or {}
+        auction_id = data.get("auction_id") or msg_data.get("auction_id") or payload.get("pk")
+        product_id = data.get("product_id") or msg_data.get("auction_product") or payload.get("product_id")
+        bid_amount = data.get("bid_amount") or msg_data.get("bid_amount")
+        if bid_amount is not None:
+            _update_cached_price(auction_id, product_id, bid_amount)
+
         snap = _convert_update_to_snapshot(data)
         if snap:
             process_external_snapshot(snap)
         return
 
-    if status in ("error", "failed") and action == "place_bid":
-        _signal_pending(data.get("request_id"), data)
-        logger.info("place_bid rejected by server: %s", data)
+    if status in ("error", "failed"):
+        # Some place_bid validation errors come back with neither `action`
+        # nor `request_id` (e.g. "Bid must be greater than current highest
+        # bid"). Resolve by id when present, else against the sole in-flight
+        # submit, instead of letting it time out for 10s.
+        if data.get("request_id"):
+            entry = _signal_pending(data.get("request_id"), data)
+            logger.info("Error response matched by request_id: %s", data)
+        else:
+            entry = _signal_pending_unmatched(data)
+            if entry:
+                logger.info("place_bid rejected by server (unmatched): %s", data)
+            else:
+                logger.debug("Unhandled error WS message: %s", data)
+
+        # The rejection tells us the true current price ("...current
+        # highest bid (9200.00)") - use it to correct the cache immediately
+        # instead of leaving it stale for every subsequent decision, and
+        # re-dispatch right away so the worker retries with the corrected
+        # price instead of sitting idle until some future WS event.
+        if entry:
+            payload = entry.get("payload") or {}
+            auction_id = payload.get("pk")
+            product_id = payload.get("product_id")
+            rejected_price = _parse_rejected_price(data.get("message"))
+            if rejected_price is not None:
+                _update_cached_price(auction_id, product_id, rejected_price)
+                item = _LAST_ITEM_MAP.get(auction_id, {}).get(product_id)
+                if item:
+                    process_external_snapshot({
+                        auction_id: {
+                            "AUCTION_ITEMS": {product_id: item},
+                            "MIN_BID_AMOUNT": item.get("MIN_BID_AMOUNT", 1),
+                        }
+                    })
         return
 
     logger.debug("Unhandled WS message: %s", data)
@@ -418,7 +565,10 @@ def start_ws_adapter(username: str, password: str, auction_pk: str = None,
         }
 
         # Register BEFORE sending so _on_message can never miss the echo.
-        entry = {"event": threading.Event(), "result": None}
+        # `payload` is kept on the entry so a reply lacking auction/product
+        # id (rejections and 'bid_added' confirmations both do) can still
+        # be attributed to the right (auction, item) for cache correction.
+        entry = {"event": threading.Event(), "result": None, "payload": payload}
         with _PENDING_LOCK:
             _PENDING_SUBMITS[req_id] = entry
 
@@ -547,3 +697,12 @@ def _patch_submit_bid(submitter):
             logger.info("AuctionPlayer module has no submit_bid attribute (skipping patch).")
     except Exception:
         logger.exception("Failed to patch AuctionPlayer.submit_bid")
+
+    try:
+        if hasattr(AuctionPlayer, "set_live_best_lookup"):
+            AuctionPlayer.set_live_best_lookup(_lookup_cached_best)
+            logger.info("Patched AuctionPlayer live-price lookup -> ws_adapter cache")
+        else:
+            logger.info("AuctionPlayer module has no set_live_best_lookup (skipping patch).")
+    except Exception:
+        logger.exception("Failed to patch AuctionPlayer live-price lookup")

@@ -112,22 +112,27 @@ def _fetch_item_block(auc: Dict[str, Any], item_id: Any) -> Dict[str, Any]:
     return {}
 
 
-def _safe_get_current_best(fallback: float) -> float:
-    """Fetch the live current best price; return `fallback` on any failure."""
-    # try:
-    #     if hasattr(AucApi, "get_current_bidding_details"):
-    #         details = get_current_bidding_details(auc_id, item_id)
-    #         if isinstance(details, dict):
-    #             for key in ("best_price", "current_bid", "current_highest", "current_price"):
-    #                 if key in details:
-    #                     return float(details[key] or 0)
-    #         if isinstance(details, (int, float)):
-    #             return float(details)
-    # except Exception:
-    #     logger.debug(
-    #         "Could not fetch live current bid for %s:%s (falling back).",
-    #         auc_id, item_id, exc_info=True,
-    #     )
+# Set at runtime by ws_adapter.py (mirrors the submit_bid monkey-patch below)
+_live_best_lookup = None
+
+def set_live_best_lookup(fn) -> None:
+    global _live_best_lookup
+    _live_best_lookup = fn
+
+def _safe_get_current_best(auc_id: str, item_id: Any, fallback: float) -> float:
+    """Fetch the most recently observed live price for (auc_id, item_id);
+    return `fallback` if no lookup is registered, it has nothing cached yet,
+    or it errors."""
+    if _live_best_lookup is not None:
+        try:
+            live = _live_best_lookup(auc_id, item_id)
+            if live is not None:
+                return float(live)
+        except Exception:
+            logger.debug(
+                "Could not fetch live current bid for %s:%s (falling back).",
+                auc_id, item_id, exc_info=True,
+            )
     return float(fallback or 0.0)
 
 
@@ -278,7 +283,7 @@ def _persist_post_bid(
     if submit_resp.get("status") == "success":
         updated["last_bot_bid_amount"] = float(resulting_price)
         updated["last_seen_external_best"] = float(
-            _safe_get_current_best(resulting_price)
+            _safe_get_current_best(auc_id, item_key, resulting_price)
         )
 
     persist_bot_state(item_assign_key, bot_id, updated)
@@ -306,7 +311,7 @@ def process_item(auc_id: str, auc: Dict[str, Any], item_key: Any, cancel_event: 
         item_block = _fetch_item_block(auc, item_key)
         fields = _extract_snapshot_fields(auc_id, item_block, auc)
 
-        best_now = _safe_get_current_best(fields["snapshot_best"])
+        best_now = _safe_get_current_best(auc_id, item_key, fields["snapshot_best"])
 
         if fields["snapshot_threshold"] and best_now >= fields["snapshot_threshold"]:
             logger.info(
@@ -323,6 +328,44 @@ def process_item(auc_id: str, auc: Dict[str, Any], item_key: Any, cancel_event: 
         r.step_index = int(state.get("num_bids_placed", 0))
 
         decision = DECISION.decide(r, state)
+
+        if decision.get("status") == "skip":
+            # Outside the bidding window.
+            wait_seconds = int(r.remaining_duration - DECISION.BID_WINDOW_SECONDS) + 1
+            logger.info(
+                "Auction %s item %s: bot %s outside bidding window (remaining=%.0fs) -> "
+                "sleeping %ss until bidding window opens",
+                auc_id, item_key, bot_id, r.remaining_duration, wait_seconds,
+            )
+            wait_started = time.time()
+            if _interruptible_wait(cancel_event, auc_id, item_assign_key, max(1, wait_seconds)):
+                return
+            if cancel_event.is_set() or is_bots_disabled(auc_id):
+                logger.info("%s: cancelled/bots_disabled after window-open wait, exiting", item_assign_key)
+                return
+
+            elapsed = time.time() - wait_started
+            fields["remaining_duration"] = max(1.0, fields["remaining_duration"] - elapsed)
+            best_now = _safe_get_current_best(auc_id, item_key, best_now)
+
+            if fields["snapshot_threshold"] and best_now >= fields["snapshot_threshold"]:
+                logger.info(
+                    "Auction %s item %s: best_now %.2f >= threshold %.2f after window-open wait -> stopping",
+                    auc_id, item_key, best_now, fields["snapshot_threshold"],
+                )
+                return
+
+            r = _build_decide_request(auc_id, item_key, bot_id, auc, item_block, fields, best_now)
+            r.step_index = int(state.get("num_bids_placed", 0))
+            decision = DECISION.decide(r, state)
+
+            if decision.get("status") == "skip":
+                logger.info(
+                    "Auction %s item %s: still outside bidding window after wait (remaining=%.0fs) -> skipping",
+                    auc_id, item_key, r.remaining_duration,
+                )
+                return
+
         decision_delay = int(decision.get("delay_seconds") or 1)
 
         # Amount policy: always bid exactly one minimum increment above the
@@ -354,7 +397,7 @@ def process_item(auc_id: str, auc: Dict[str, Any], item_key: Any, cancel_event: 
 
         # Someone may have bid during our wait. Step one increment above the
         # new live best instead of our stale target.
-        live_before_submit = _safe_get_current_best(best_now)
+        live_before_submit = _safe_get_current_best(auc_id, item_key, best_now)
         if live_before_submit >= resulting_price:
             resulting_price = round(live_before_submit + fields["min_allowed"], 2)
 
@@ -408,7 +451,7 @@ def process_item(auc_id: str, auc: Dict[str, Any], item_key: Any, cancel_event: 
             decision, state, resulting_price, submit_resp,
         )
 
-        latest_best = _safe_get_current_best(resulting_price)
+        latest_best = _safe_get_current_best(auc_id, item_key, resulting_price)
         if fields["snapshot_threshold"] and latest_best >= fields["snapshot_threshold"]:
             logger.info(
                 "Auction %s item %s: reached threshold (best %.2f >= threshold %.2f) -> stopping worker",
